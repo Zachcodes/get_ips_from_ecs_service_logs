@@ -2,11 +2,44 @@ const AWS = require('aws-sdk');
 const awsConfig = { region: 'us-west-2' };
 const CloudWatch = new AWS.CloudWatchLogs(awsConfig);
 const Route53 = new AWS.Route53(awsConfig);
+const ELB = new AWS.ELBv2(awsConfig);
+const EC2 = new AWS.EC2(awsConfig);
 
-if(process.argv.length < 3) {
-    console.warn("Missing required log name parameters");
-    process.exit(1);
-}
+ELB.describeLoadBalancers({}, (err, instances) => {
+    const elbIps = {};
+    const vpcIds = instances.LoadBalancers.reduce( (vpcs, loadBalancer) => {
+        if(vpcs.indexOf(loadBalancer.VpcId) === -1) {
+            vpcs.push(loadBalancer.VpcId)
+        }
+        return vpcs;
+    }, []);
+    EC2.describeNetworkInterfaces({ Filters: [ { Name: 'vpc-id', Values: vpcIds } ] }, (err, interface) => {
+        interface.NetworkInterfaces.forEach( interface => {
+            const ipsInInterface = [
+                interface.PrivateIpAddress,
+                interface.PrivateIpAddresses.map( private => {
+                    const privateArr = [ private.PrivateIpAddress ];
+                    if(private.Association) {
+                        privateArr.push(private.PublicIp);
+                    }
+                    return privateArr;
+                }).flat()
+            ];
+            ipsInInterface.forEach( ip => {
+                if(!elbIps[ip]) {
+                    elbIps[ip] = {
+                        relatedNetworkInterfaces: []
+                    }
+                }
+                elbIps[ip]['relatedNetworkInterfaces'].push({ id: interface.NetworkInterfaceId, description: interface.Description });
+            });
+        });
+    });
+})
+// if(process.argv.length < 3) {
+//     console.warn("Missing required log name parameters");
+//     process.exit(1);
+// }
 
 class ServiceIpMapper {
     constructor(logGroupName, logStreamNamePrefix) {
@@ -25,41 +58,37 @@ class ServiceIpMapper {
 
     async generateDomainsWithIpAddresses() {
         const zoneMap = {};
-        return new Promise(( res ) => {
-            Route53.listHostedZones({}, async (err, zones) => {
-                const promises = [];
-                zones.HostedZones.forEach( zone => {
-                    zoneMap[zone.Id] = { name: zone.Name, ipMap: {} };
-                    promises.push(new Promise(( resolve ) => {
-                        Route53.listResourceRecordSets({ HostedZoneId: zone.Id }, (err, resourceSet) => {
-                            resourceSet.ResourceRecordSets.forEach( set => {
-                                if(zoneMap[zone.Id].ipMap[set.Name]) {
-                                    zoneMap[zone.Id].ipMap[set.Name] = zoneMap[zone.Id].ipMap[set.Name].concat([...set.ResourceRecords]);
-                                }
-                                else {
-                                    zoneMap[zone.Id].ipMap[set.Name] = [...set.ResourceRecords];
-                                }
-                            });
-                            
-                            resolve();
-                        });
-                    }))
+        const zones = await Route53.listHostedZones({}).promise();
+        const promises = [];
+        zones.HostedZones.forEach( zone => {
+            zoneMap[zone.Id] = { name: zone.Name, ipMap: {} };
+            promises.push(new Promise(async ( resolve ) => {
+                const resourceSet = await Route53.listResourceRecordSets({ HostedZoneId: zone.Id }).promise();
+                resourceSet.ResourceRecordSets.forEach( set => {
+                    if(zoneMap[zone.Id].ipMap[set.Name]) {
+                        zoneMap[zone.Id].ipMap[set.Name] = zoneMap[zone.Id].ipMap[set.Name].concat([...set.ResourceRecords]);
+                    }
+                    else {
+                        zoneMap[zone.Id].ipMap[set.Name] = [...set.ResourceRecords];
+                    }
                 });
-                await Promise.all(promises);
-                this.zoneMap = Object.keys(zoneMap).reduce( (finalMap, zoneId) => {
-                    finalMap[zoneMap[zoneId].name] = { ipMap: zoneMap[zoneId].ipMap };
-                    return finalMap;
-                }, {});
-                res();
-            });
+                resolve();
+            }))
         });
+        await Promise.all(promises);
+        this.zoneMap = Object.keys(zoneMap).reduce( (finalMap, zoneId) => {
+            finalMap[zoneMap[zoneId].name] = { ipMap: zoneMap[zoneId].ipMap };
+            return finalMap;
+        }, {});
     }
 
     getUniqueIpsFromZoneMap() {
         this.uniqueIps = {};
-        Object.keys(this.zoneMap).map( zoneName => {
+        Object.keys(this.zoneMap)
+        .map( zoneName => {
             for(const resourceName in this.zoneMap[zoneName].ipMap) {
-                this.zoneMap[zoneName].ipMap[resourceName].forEach( ipArr => {
+                this.zoneMap[zoneName].ipMap[resourceName]
+                .forEach( ipArr => {
                     if(this.uniqueIps[ipArr.Value]) {
                         this.uniqueIps[ipArr.Value].push({ zone: zoneName, resourceName: resourceName });
                     }
@@ -72,16 +101,11 @@ class ServiceIpMapper {
     }
 
     async getStreamsWithEvents() {
-        return new Promise(( res, rej ) => {
-            CloudWatch.describeLogStreams({
-                logGroupName: this.logGroupName,
-                logStreamNamePrefix: this.logStreamNamePrefix
-            }, (err, data) => {
-                if(err) rej(err);
-                this.streams =  data.logStreams.filter( stream => stream.hasOwnProperty('firstEventTimestamp'));
-                res();
-            });
-        })
+        const { logStreams } = await CloudWatch.describeLogStreams({
+            logGroupName: this.logGroupName,
+            logStreamNamePrefix: this.logStreamNamePrefix
+        }).promise();
+        this.streams = logStreams.filter( stream => stream.hasOwnProperty('firstEventTimestamp'));
     }
 
     async processStreams() {
@@ -114,7 +138,7 @@ class ServiceIpMapper {
                     .filter( event => !/(?:connect\(\) failed)/.test(event.message))
                     .map( event => event.message)
                 );
-                if(nextForwardToken == data.nextForwardToken || onlyApiReqs.length >= 1000 || !data.events.length) {
+                if(nextForwardToken == data.nextForwardToken || onlyApiReqs.length >= 10000 || !data.events.length) {
                     return res(onlyApiReqs);
                 }
                 nextForwardToken = data.nextForwardToken;
@@ -127,19 +151,20 @@ class ServiceIpMapper {
     createRequestIpDictionary() {
         this.ipDictionary = this.logEvents.flat()
             .reduce( (dict, message) => {
-                const ipAddressMatches = message.match(/(\d+\.{1})+\d/);
+                const ipAddressMatches = message.match(/(?:\d+\.){3,5}\d+/g);
                 const reqUrlMatches = message.match(/((\/[\d\w-]+)+\sHTTP)/);
                 if(!ipAddressMatches || !reqUrlMatches) return dict;
                 const reqUrl = reqUrlMatches[0].split(' ')[0];
-                const requestingIp = ipAddressMatches[0];
-                if(!dict[requestingIp] || !dict[requestingIp][reqUrl]) {
-                    dict[requestingIp] = {
-                        [reqUrl]: { hits: 1 }
+                ipAddressMatches.forEach( requestingIp => {
+                    if(!dict[requestingIp] || !dict[requestingIp][reqUrl]) {
+                        dict[requestingIp] = {
+                            [reqUrl]: { hits: 1 }
+                        }
                     }
-                }
-                else {
-                    dict[requestingIp][reqUrl]['hits'] = dict[requestingIp][reqUrl]['hits'] + 1;
-                }
+                    else {
+                        dict[requestingIp][reqUrl]['hits'] = dict[requestingIp][reqUrl]['hits'] + 1;
+                    }
+                });
                 return dict;
         }, {});
     }
@@ -156,5 +181,5 @@ class ServiceIpMapper {
     }
 }
 
-const mapper = new ServiceIpMapper(process.argv[2], process.argv[3]);
-mapper.generateIpMapping();
+// const mapper = new ServiceIpMapper(process.argv[2], process.argv[3]);
+// mapper.generateIpMapping();
