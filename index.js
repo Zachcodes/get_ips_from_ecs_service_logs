@@ -1,5 +1,7 @@
 const AWS = require('aws-sdk');
-const CloudWatch = new AWS.CloudWatchLogs({ region: 'us-west-2' });
+const awsConfig = { region: 'us-west-2' };
+const CloudWatch = new AWS.CloudWatchLogs(awsConfig);
+const Route53 = new AWS.Route53(awsConfig);
 
 if(process.argv.length < 3) {
     console.warn("Missing required log name parameters");
@@ -13,11 +15,60 @@ class ServiceIpMapper {
     }
 
     async generateIpMapping() {
+        await this.generateDomainsWithIpAddresses();
+        this.getUniqueIpsFromZoneMap();
         await this.getStreamsWithEvents();
         await this.processStreams();
-        this.createIpDictionary();
-        console.log("IP Dictionary\n\n");
-        console.log(this.ipDictionary);
+        this.createRequestIpDictionary();
+        this.matchRequestIpsToZoneIpMap();
+    }
+
+    async generateDomainsWithIpAddresses() {
+        const zoneMap = {};
+        return new Promise(( res ) => {
+            Route53.listHostedZones({}, async (err, zones) => {
+                const promises = [];
+                zones.HostedZones.forEach( zone => {
+                    zoneMap[zone.Id] = { name: zone.Name, ipMap: {} };
+                    promises.push(new Promise(( resolve ) => {
+                        Route53.listResourceRecordSets({ HostedZoneId: zone.Id }, (err, resourceSet) => {
+                            resourceSet.ResourceRecordSets.forEach( set => {
+                                if(zoneMap[zone.Id].ipMap[set.Name]) {
+                                    zoneMap[zone.Id].ipMap[set.Name] = zoneMap[zone.Id].ipMap[set.Name].concat([...set.ResourceRecords]);
+                                }
+                                else {
+                                    zoneMap[zone.Id].ipMap[set.Name] = [...set.ResourceRecords];
+                                }
+                            });
+                            
+                            resolve();
+                        });
+                    }))
+                });
+                await Promise.all(promises);
+                this.zoneMap = Object.keys(zoneMap).reduce( (finalMap, zoneId) => {
+                    finalMap[zoneMap[zoneId].name] = { ipMap: zoneMap[zoneId].ipMap };
+                    return finalMap;
+                }, {});
+                res();
+            });
+        });
+    }
+
+    getUniqueIpsFromZoneMap() {
+        this.uniqueIps = {};
+        Object.keys(this.zoneMap).map( zoneName => {
+            for(const resourceName in this.zoneMap[zoneName].ipMap) {
+                this.zoneMap[zoneName].ipMap[resourceName].forEach( ipArr => {
+                    if(this.uniqueIps[ipArr.Value]) {
+                        this.uniqueIps[ipArr.Value].push({ zone: zoneName, resourceName: resourceName });
+                    }
+                    else {
+                        this.uniqueIps[ipArr.Value] = [{ zone: zoneName, resourceName: resourceName }];
+                    }
+                })
+            }
+        })
     }
 
     async getStreamsWithEvents() {
@@ -73,7 +124,7 @@ class ServiceIpMapper {
         loopStream.call(this, true);
     }
  
-    createIpDictionary() {
+    createRequestIpDictionary() {
         this.ipDictionary = this.logEvents.flat()
             .reduce( (dict, message) => {
                 const ipAddressMatches = message.match(/(\d+\.{1})+\d/);
@@ -91,6 +142,17 @@ class ServiceIpMapper {
                 }
                 return dict;
         }, {});
+    }
+
+    matchRequestIpsToZoneIpMap() {
+        for(const requestIp in this.ipDictionary) {
+            if(this.uniqueIps[requestIp]) {
+                console.log("*** FOUND A MATCH ***\n");
+                console.log(`Request Ip: ${requestIp}`);
+                console.log(`Matched Route 53 ip: \n`);
+                console.log(this.uniqueIps[requestIp])
+            }
+        }
     }
 }
 
