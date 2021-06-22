@@ -5,49 +5,20 @@ const Route53 = new AWS.Route53(awsConfig);
 const ELB = new AWS.ELBv2(awsConfig);
 const EC2 = new AWS.EC2(awsConfig);
 
-ELB.describeLoadBalancers({}, (err, instances) => {
-    const elbIps = {};
-    const vpcIds = instances.LoadBalancers.reduce( (vpcs, loadBalancer) => {
-        if(vpcs.indexOf(loadBalancer.VpcId) === -1) {
-            vpcs.push(loadBalancer.VpcId)
-        }
-        return vpcs;
-    }, []);
-    EC2.describeNetworkInterfaces({ Filters: [ { Name: 'vpc-id', Values: vpcIds } ] }, (err, interface) => {
-        interface.NetworkInterfaces.forEach( interface => {
-            const ipsInInterface = [
-                interface.PrivateIpAddress,
-                interface.PrivateIpAddresses.map( private => {
-                    const privateArr = [ private.PrivateIpAddress ];
-                    if(private.Association) {
-                        privateArr.push(private.PublicIp);
-                    }
-                    return privateArr;
-                }).flat()
-            ];
-            ipsInInterface.forEach( ip => {
-                if(!elbIps[ip]) {
-                    elbIps[ip] = {
-                        relatedNetworkInterfaces: []
-                    }
-                }
-                elbIps[ip]['relatedNetworkInterfaces'].push({ id: interface.NetworkInterfaceId, description: interface.Description });
-            });
-        });
-    });
-})
-// if(process.argv.length < 3) {
-//     console.warn("Missing required log name parameters");
-//     process.exit(1);
-// }
+if(process.argv.length < 3) {
+    console.warn("Missing required log name parameters");
+    process.exit(1);
+}
 
 class ServiceIpMapper {
     constructor(logGroupName, logStreamNamePrefix) {
         this.logGroupName = logGroupName;
         this.logStreamNamePrefix = logStreamNamePrefix;
+        this.uniqueIps = {};
     }
 
     async generateIpMapping() {
+        await this.buildEC2IpDict();
         await this.generateDomainsWithIpAddresses();
         this.getUniqueIpsFromZoneMap();
         await this.getStreamsWithEvents();
@@ -82,19 +53,54 @@ class ServiceIpMapper {
         }, {});
     }
 
+    async buildEC2IpDict() {
+        const instances = await ELB.describeLoadBalancers({}).promise();
+        const elbIps = {};
+        const vpcIds = instances.LoadBalancers.reduce( (vpcs, loadBalancer) => {
+            if(vpcs.indexOf(loadBalancer.VpcId) === -1) {
+                vpcs.push(loadBalancer.VpcId)
+            }
+            return vpcs;
+        }, []);
+        const interfaces = await EC2.describeNetworkInterfaces({ Filters: [ { Name: 'vpc-id', Values: vpcIds } ] }).promise();
+        interfaces.NetworkInterfaces.forEach( networkInterface => {
+            const ipsInInterface = [
+                networkInterface.PrivateIpAddress,
+                networkInterface.PrivateIpAddresses
+                .map( privateIp => {
+                    const privateArr = [ privateIp.PrivateIpAddress ];
+                    if(privateIp.Association) {
+                        privateArr.push(privateIp.PublicIp);
+                    }
+                    return privateArr;
+                }).flat()
+            ];
+            ipsInInterface
+            .forEach( ip => {
+                if(!elbIps[ip]) {
+                    elbIps[ip] = {
+                        relatedNetworkInterfaces: []
+                    }
+                }
+                elbIps[ip]['relatedNetworkInterfaces']
+                .push({ id: networkInterface.NetworkInterfaceId, description: networkInterface.Description });
+            });
+        });
+        this.uniqueIps = elbIps;
+    }
+
     getUniqueIpsFromZoneMap() {
-        this.uniqueIps = {};
         Object.keys(this.zoneMap)
         .map( zoneName => {
             for(const resourceName in this.zoneMap[zoneName].ipMap) {
                 this.zoneMap[zoneName].ipMap[resourceName]
                 .forEach( ipArr => {
-                    if(this.uniqueIps[ipArr.Value]) {
-                        this.uniqueIps[ipArr.Value].push({ zone: zoneName, resourceName: resourceName });
+                    if(!this.uniqueIps[ipArr.Value] || !this.uniqueIps[ipArr.Value].relatedNetworkInterfaces) {
+                        this.uniqueIps[ipArr.Value] = this.uniqueIps[ipArr.Value] 
+                        ? { ...this.uniqueIps[ipArr.Value], relatedNetworkInterfaces: []} 
+                        : { relatedNetworkInterfaces: [] };
                     }
-                    else {
-                        this.uniqueIps[ipArr.Value] = [{ zone: zoneName, resourceName: resourceName }];
-                    }
+                    this.uniqueIps[ipArr.Value].relatedNetworkInterfaces.push({ zone: zoneName, resourceName: resourceName });
                 })
             }
         })
@@ -131,6 +137,7 @@ class ServiceIpMapper {
 
             CloudWatch.getLogEvents(options, (err, data) => {
                 if(err) rej(err);
+                if(!data || !data.events.length) return;
                 onlyApiReqs = onlyApiReqs.concat(
                     data.events.filter( event => {
                     return /"(GET|PUT|POST)/.test(event.message)
@@ -181,5 +188,5 @@ class ServiceIpMapper {
     }
 }
 
-// const mapper = new ServiceIpMapper(process.argv[2], process.argv[3]);
-// mapper.generateIpMapping();
+const mapper = new ServiceIpMapper(process.argv[2], process.argv[3]);
+mapper.generateIpMapping();
