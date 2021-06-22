@@ -15,6 +15,7 @@ class ServiceIpMapper {
         this.logGroupName = logGroupName;
         this.logStreamNamePrefix = logStreamNamePrefix;
         this.uniqueIps = {};
+        this.streamQueue = [];
     }
 
     async generateIpMapping() {
@@ -103,7 +104,7 @@ class ServiceIpMapper {
                     this.uniqueIps[ipArr.Value].relatedNetworkInterfaces.push({ zone: zoneName, resourceName: resourceName });
                 })
             }
-        })
+        });
     }
 
     async getStreamsWithEvents() {
@@ -115,10 +116,19 @@ class ServiceIpMapper {
     }
 
     async processStreams() {
+        this.processedStreamsCount = 0;
+        this.intervalId = setInterval(() => {
+            console.log(`Event queue length: ${this.streamQueue.length}`);
+            const eventsToProcess = this.streamQueue.splice(0, 5);
+            this.processedStreamsCount += eventsToProcess.length;
+            eventsToProcess.map( event => event[0].apply(this, [...event.slice(1)]));
+        }, 1500);
         const logEventsPromises = this.streams.map( stream => {
             return new Promise(( res, rej ) => this.getAllEventsForStream(res, rej, stream.logStreamName))
         });
         const logEvents = await Promise.all(logEventsPromises);
+        clearInterval(this.intervalId);
+        console.log(`Processed ${this.processedStreamsCount} total log streams`);
         this.logEvents = logEvents.filter( eventArr => eventArr.length);
     }
 
@@ -137,7 +147,7 @@ class ServiceIpMapper {
 
             CloudWatch.getLogEvents(options, (err, data) => {
                 if(err) rej(err);
-                if(!data || !data.events.length) return;
+                if(!data || !data.events.length) return res(onlyApiReqs);;
                 onlyApiReqs = onlyApiReqs.concat(
                     data.events.filter( event => {
                     return /"(GET|PUT|POST)/.test(event.message)
@@ -145,14 +155,14 @@ class ServiceIpMapper {
                     .filter( event => !/(?:connect\(\) failed)/.test(event.message))
                     .map( event => event.message)
                 );
-                if(nextForwardToken == data.nextForwardToken || onlyApiReqs.length >= 10000 || !data.events.length) {
+                if(nextForwardToken == data.nextForwardToken || onlyApiReqs.length >= 5000) {
                     return res(onlyApiReqs);
                 }
                 nextForwardToken = data.nextForwardToken;
-                loopStream.call(this);
+                this.streamQueue.push([loopStream]);
             });
         }
-        loopStream.call(this, true);
+        this.streamQueue.push([loopStream, true]);
     }
  
     createRequestIpDictionary() {
