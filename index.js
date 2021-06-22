@@ -16,6 +16,7 @@ class ServiceIpMapper {
         this.logStreamNamePrefix = logStreamNamePrefix;
         this.uniqueIps = {};
         this.streamQueue = [];
+        this.oldestLogTimestamps = [];
     }
 
     async generateIpMapping() {
@@ -156,6 +157,7 @@ class ServiceIpMapper {
                     .map( event => event.message)
                 );
                 if(nextForwardToken == data.nextForwardToken || onlyApiReqs.length >= 5000) {
+                    this.oldestLogTimestamps.push(this.formatDateForLog(data.events[data.events.length - 1]));
                     return res(onlyApiReqs);
                 }
                 nextForwardToken = data.nextForwardToken;
@@ -163,6 +165,15 @@ class ServiceIpMapper {
             });
         }
         this.streamQueue.push([loopStream, true]);
+    }
+
+    formatDateForLog(event) {
+        const timestamp = event.timestamp;
+        const date = new Date(timestamp);
+        const year = date.getFullYear();
+        const dayOfMonth = date.getDate();
+        const month = date.getMonth() + 1;
+        return `${year}/${month}/${dayOfMonth}`;
     }
  
     createRequestIpDictionary() {
@@ -189,12 +200,30 @@ class ServiceIpMapper {
     matchRequestIpsToZoneIpMap() {
         for(const requestIp in this.ipDictionary) {
             if(this.uniqueIps[requestIp]) {
-                console.log("*** FOUND A MATCH ***\n");
+                const sortedEndpointsByHits = Object.keys(this.ipDictionary[requestIp])
+                .map( endpointRequested => {
+                    return { [endpointRequested]: this.ipDictionary[requestIp][endpointRequested]['hits'] }
+                })
+                .sort((endpointA, endpointB) => {
+                    if (endpointA.hits < endpointB.hits) {
+                        return -1;
+                    }
+                    if (endpointA.hits > endpointB.hits) {
+                        return 1;
+                    }
+                    return 0;
+                })
+                .slice(0, 10);
+                console.log("\n*** FOUND A MATCH ***\n");
                 console.log(`Request Ip: ${requestIp}`);
-                console.log(`Matched Route 53 ip: \n`);
-                console.log(this.uniqueIps[requestIp])
+                console.log(`\nMatched Route 53 ip: \n`);
+                console.log(this.uniqueIps[requestIp]);
+                console.log(`\nTop routes requested by hit count:`);
+                console.log(sortedEndpointsByHits);
             }
         }
+        console.log(`\n\nOldest Timestamps Requested`);
+        console.log(this.oldestLogTimestamps);
     }
 }
 
