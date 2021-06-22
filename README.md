@@ -1,4 +1,4 @@
-This is a utility script that allows you to grab the nginx logs of any ECS service and then filter down which endpoints have been requested and from where as well as a hit count. Useful for backtracing in Route 53 to find the AWS services in your region that are making requests.
+This is a utility script that allows you to grab the nginx logs of any ECS service and then filter down which endpoints have been requested and from where as well as a hit count. Useful for backtracing in Route 53 to find the AWS services in your region that are making requests. It also pulls in all EC2 load balancers at the time of running the script and grabs all their ip addresses so we can match against those.
 
 Run the script like so
 
