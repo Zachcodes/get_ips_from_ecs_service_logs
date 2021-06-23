@@ -172,9 +172,11 @@ class ServiceIpMapper {
         const timestamp = event.timestamp;
         const date = new Date(timestamp);
         const year = date.getFullYear();
-        const dayOfMonth = date.getDate();
-        const month = date.getMonth() + 1;
-        return `${year}/${month}/${dayOfMonth}`;
+        const dayOfMonth = ((day) => day >= 10 ? day : `0${day}`)(date.getDate());
+        const month = (month => month >= 10 ? month : `0${month}`)(date.getMonth() + 1);
+        const hours = (hoursRaw => hoursRaw >= 13 ? [hoursRaw - 12, 'PM'] : [hoursRaw, 'AM'])(date.getHours());
+        const minutes = ((minuteRaw) => minuteRaw >= 10 ? minuteRaw : `0${minuteRaw}`)(date.getMinutes());
+        return `${month}/${dayOfMonth}/${year} ${hours[0]}:${minutes} ${hours[1]}`;
     }
  
     createRequestIpDictionary() {
