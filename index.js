@@ -136,6 +136,7 @@ class ServiceIpMapper {
     getAllEventsForStream(res, rej, logStreamName) {
         let nextForwardToken = '';
         let onlyApiReqs = [];
+        const timestampIndex = this.oldestLogTimestamps.length;
         function loopStream(useStart = false) {
             const options = {
                 logGroupName: this.logGroupName,
@@ -148,7 +149,8 @@ class ServiceIpMapper {
 
             CloudWatch.getLogEvents(options, (err, data) => {
                 if(err) rej(err);
-                if(!data || !data.events.length) return res(onlyApiReqs);;
+                if(!data || !data.events.length) return res(onlyApiReqs);
+                this.oldestLogTimestamps[timestampIndex] = this.formatDateForLog(data.events[data.events.length - 1]);
                 onlyApiReqs = onlyApiReqs.concat(
                     data.events.filter( event => {
                     return /"(GET|PUT|POST)/.test(event.message)
@@ -157,7 +159,6 @@ class ServiceIpMapper {
                     .map( event => event.message)
                 );
                 if(nextForwardToken == data.nextForwardToken || onlyApiReqs.length >= 5000) {
-                    this.oldestLogTimestamps.push(this.formatDateForLog(data.events[data.events.length - 1]));
                     return res(onlyApiReqs);
                 }
                 nextForwardToken = data.nextForwardToken;
